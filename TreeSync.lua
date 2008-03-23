@@ -67,25 +67,31 @@ local synchedNodes = treeSync.synchedNodes or {}
 local synchedTrees = treeSync.synchedTrees or {}
 local timeOffsets = treeSync.timeOffsets or {}
 local targetCommands = treeSync.targetCommands or {}
+local pathToNode = treeSync.pathToNode or {}
+local parentOfNode = treeSync.parentOfNode or {}
+local registeredPrefix = treeSync.registeredPrefix or {}
+local logFile = treeSync.logFile or {}
 local responseQue = treeSync.responseQue or {}
 local requestQue = treeSync.requestQue or {}
 local announceQue = treeSync.announceQue or {}
-local pathToNode = treeSync.pathToNode or {}
-local registeredPrefix = treeSync.registeredPrefix or {}
-local logFile = treeSync.logFile or {}
+local importQue = treeSync.importQue or {}
+local importRequestedQue = treeSync.importRequestedQue or {}
 
-local treeSync.nodeCompareTables = nodeCompareTables
-local treeSync.nodeSendTables = nodeSendTables
-local treeSync.synchedNodes = synchedNodes
-local treeSync.synchedTrees = synchedTrees
-local treeSync.timeOffsets = timeOffsets
-local treeSync.targetCommands = targetCommands
-local treeSync.responseQue = responseQue
-local treeSync.requestQue = requestQue
-local treeSync.announceQue = announceQue
-local treeSync.pathToNode = pathToNode
-local treeSync.registeredPrefix = registeredPrefix
-local treeSync.logFile = logFile
+treeSync.nodeCompareTables = nodeCompareTables
+treeSync.nodeSendTables = nodeSendTables
+treeSync.synchedNodes = synchedNodes
+treeSync.synchedTrees = synchedTrees
+treeSync.timeOffsets = timeOffsets
+treeSync.targetCommands = targetCommands
+treeSync.pathToNode = pathToNode
+treeSync.parentOfNode = parentOfNode
+treeSync.registeredPrefix = registeredPrefix
+treeSync.logFile = logFile
+treeSync.responseQue = responseQue
+treeSync.requestQue = requestQue
+treeSync.announceQue = announceQue
+treeSync.importQue = importQue
+treeSync.importRequestedQue = importRequestedQue
 
 local rootNode
 
@@ -99,11 +105,13 @@ local function log(msg, ...)
 	end
 end
 
+local sendRequest, getLocalNode
+
 do
 	local telapsed = 0
 	local function _onUpdate(f, elapsed)
 		telapsed = telapsed + elapsed
-		local path, command
+		local path, command, node
 		if telapsed > 0.5 then
 			-- process 1 response message
 			repeat
@@ -123,6 +131,23 @@ do
 			command = tremove(announceQue, 1)
 			if command then
 				AceComm:SendCommMessage(myprefix, command, "GUILD", nil, "BULK")
+			end
+			-- process 1 import command
+			node = tremove(importQue, 1)
+			if node then
+				local parentPath = parentOfNode[node.path]
+				local parent = pathToNode[parentPath]
+				if (parent) then
+					importRequestedQue[node.path] = nil
+					parent.branches[node.name] = node
+				else
+					tinsert(importQue, node)
+					if (not importRequestedQue[parentPath]) then
+						-- request the parent node to be sent, insert the local node to the waiting que
+						local serialized = serializer:Serialize("requestNodeData", localTreePath)
+						sendRequest(serialized, localTreePath, true)
+					end
+				end
 			end
 			telapsed = 0
 		end
@@ -210,8 +235,12 @@ local function updatePaths(treeNode, path)
 	end
 end
 
-local function sendRequest(command, path)
-	tinsert(requestQue, command)
+local function sendRequest(command, path, head)
+	if head then
+		tinsert(requestQue, 1, command)
+	else
+		tinsert(requestQue, command)
+	end
 end
 
 local function sendAnnounce(command)
@@ -326,19 +355,24 @@ end
 local commandParsers = {
 	-- this RECEIVES the data
 	['sendNodeData'] = function(prefix, sentNode, sender, target)
+		local shouldImport = false
 		normalizeTimes(sentNode, sender)
 		-- if we don't know about the node, then create a table to hold teh
 		-- data
 		local lNode = getLocalNode(sentNode.path)
-		if (not lNode) then 
+		if (not lNode) then
+			shouldImport = true
 			lNode = treeSync:NewNode(prefix, sentNode.name, sentNode.path)
-			local parentPath = string.match(sentNode.path, "^.+"..sep.."(.-)"..sep..".-$")
-			local parent = getLocalNode(parentPath)
 		end
+		local parentPath = string.match(sentNode.path, "^.+"..sep.."(.-)"..sep..".-$")
+		parentOfNode[sentNode.path] = parentPath
 		lNode.data = cpyTbl(sentNode.data)
 		lNode.nodeModTime = sentNode.nodeModTime
 		synchedNodes[sentNode.path] = true
 		synchedTrees[sentNode.path] = checkSync(lNode)
+		if (shouldImport) then
+			tinsert(importQue, lNode)
+		end
 	end,
 	-- this SENDS the data
 	['requestNodeData'] = function(prefix, path, sender)
@@ -406,7 +440,7 @@ function treeSync:NewNode(prefix, name, path)
 		treeModTime = _now,
 		nodeModTime = _now,
 		name = name,
-		path = (path or prefix) .. sep .. name,
+		path = (path or sep .. prefix) .. sep .. name,
 		branches = {},
 	}
 	return t
@@ -417,7 +451,7 @@ function treeSync:RegisterTable(prefix, root)
 	rootNode = root
 	registeredPrefix[prefix] = root
 	log(format("RegisterTable: prefix: %s", (prefix or "Unknown prefix")))
-	updatePaths(root, sep)
+	updatePaths(root, sep..prefix)
 	local data = serializer:Serialize("timeLogin", GetTime())
 	AceComm:SendCommMessage(prefix, data, "GUILD", nil, "ALERT")
 	log(format("Sent timeLogin: %s", data))
